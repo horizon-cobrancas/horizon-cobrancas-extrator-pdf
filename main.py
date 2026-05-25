@@ -74,6 +74,10 @@ def parse_br_date(val: str) -> Optional[str]:
     except:
         return v
 
+@app.get("/")
+def read_root():
+    return {"status": "alive"}
+
 @app.post("/v1/extract/condominio21", response_model=List[ChargeJSON])
 async def extract_condominio21(file: UploadFile = File(...)):
     """
