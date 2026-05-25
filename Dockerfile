@@ -22,7 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia o restante do código
 COPY . .
 
-EXPOSE 8000
+# Libera a porta padrão da internet
+EXPOSE 80
 
-# Inicia o FastAPI usando uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Inicia o FastAPI usando uvicorn na porta 80
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
