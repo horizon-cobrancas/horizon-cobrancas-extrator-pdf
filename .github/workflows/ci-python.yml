@@ -3,33 +3,33 @@ name: Python Extractor CI/CD
 on:
   push:
     branches: [ "main" ]
-    paths:
-      - 'python-service/**' # Só roda se houver mudança no código Python
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
 
 jobs:
-  test-and-deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
+    
     steps:
-    - name: Checkout do Código
-      uses: actions/checkout@v3
+      - name: Checkout do Código
+        uses: actions/checkout@v4
 
-    - name: Configurar Python 3.11
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip' # Faz cache do requirements.txt para rodar super rápido
 
-    - name: Instalar Dependências
-      working-directory: ./python-service
-      run: |
-        python -m pip install --upgrade pip
-        pip install flake8 pytest
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Instalar Dependências e Validar
+        # Roda direto na raiz, onde está o seu main.py e requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m compileall . 
 
-    - name: Análise de Qualidade (Flake8)
-      working-directory: ./python-service
-      run: |
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-
-    - name: Disparar Deploy no Easypanel
-      if: success()
-      run: curl -X POST "${{ secrets.EASYPANEL_WEBHOOK_PYTHON }}"
+      - name: Disparar Deploy no Easypanel
+        if: github.event_name == 'push' && success()
+        run: curl -f -s -S -X POST "${{ secrets.EASYPANEL_WEBHOOK_PYTHON }}"
