@@ -518,8 +518,7 @@ async def extract_superlogica(file: UploadFile = File(...)):
                             "message": "Você selecionou Superlógica, mas este arquivo pertence ao Condomínio21."}
                 )
 
-            # 4. Validação Positiva (Opcional, mas muito recomendada)
-            # Se não tem a assinatura nativa do Superlógica, rejeita também!
+            # 4. Validação Positiva
             if "Valores atualizados até" not in first_page_text and "Compet." not in first_page_text:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -528,16 +527,20 @@ async def extract_superlogica(file: UploadFile = File(...)):
                 )
         # ==========================================
 
-    # FIX 1: Memória fora do loop de páginas
     current_unit, current_name = None, None
-    current_condominium = None  # <-- Memória do Condomínio
+    current_condominium = None
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # FIX 2: Regex preparado para números negativos
+        # Regex da Dívida
         pattern = re.compile(
             r"^(\d{2}/\d{2}/\d{2,4})\s+(\d{2}/\d{4})\s+(\d+)\s+(\d+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)$"
         )
-        unit_pattern = re.compile(r"^([A-Za-z0-9-]+)\s+Unidade\s+(?:-\s+)?(.*)$")
+
+        # MODELO 1: Padrão antigo que você já tinha (Ex: "101 Unidade - JULIANA" ou "101 Unidade JULIANA")
+        unit_pattern_legacy = re.compile(r"^([A-Za-z0-9-]+)\s+Unidade\s+(?:-\s+)?(.*)$", re.IGNORECASE)
+
+        # MODELO 2: Padrão novo/Berlim (Ex: "101 BLOCO 1 JULIANA" ou apenas "101 JULIANA")
+        unit_pattern_new = re.compile(r"^([A-Za-z0-9-]+)\s+(?:BLOCO\s+([A-Za-z0-9]+)\s+)?(.*)$", re.IGNORECASE)
 
         for page in pdf.pages:
             text = page.extract_text(layout=True)
@@ -545,44 +548,69 @@ async def extract_superlogica(file: UploadFile = File(...)):
 
             lines = [re.sub(r'\s+', ' ', line.strip()) for line in text.split('\n') if line.strip()]
 
-            # Usamos o enumerate para ter acesso ao índice (idx) da linha atual
             for idx, line in enumerate(lines):
 
                 # ==========================================
-                # CAPTURA DO CONDOMÍNIO (Armadilha Superlógica)
-                # Se achou "Inadimplentes", pega a linha imediatamente anterior!
+                # CAPTURA DO CONDOMÍNIO
                 # ==========================================
                 if "Inadimplentes" in line and not current_condominium:
                     if idx > 0:
                         raw_condo = lines[idx - 1].strip()
-
-                        # 1. Tira o código inicial (Ex: "W003A ")
                         clean_condo = re.sub(r"^[A-Za-z0-9]+\s+", "", raw_condo)
-                        # 2. Tira o ID final entre parênteses (Ex: " (9)")
                         clean_condo = re.sub(r"\s*\(\d+\)$", "", clean_condo)
-
                         current_condominium = clean_condo.strip()
-                # ==========================================
 
-                # Pula cabeçalhos e totalizadores
-                if "Vencimento" in line or line.startswith("Total") or "Inadimplentes" in line:
+                # Ignora cabeçalhos, totalizadores e linhas de metadados da Superlógica
+                if "Vencimento" in line or line.startswith(
+                        "Total") or "Inadimplentes" in line or "Valores atualizados" in line:
                     continue
 
-                # Identifica se é a linha de troca de Unidade/Morador
-                u_match = unit_pattern.match(line)
-                if u_match:
-                    current_unit = u_match.group(1).strip()
-                    raw_name = u_match.group(2).strip()
+                # Proteção extra: Impede que a primeira linha (nome do condomínio) seja confundida com um morador
+                if current_condominium and current_condominium in line:
+                    continue
 
-                    # Limpa as tags de status que o Superlógica pendura no final do nome
+                # ==========================================
+                # IDENTIFICA TROCA DE UNIDADE/MORADOR
+                # ==========================================
+
+                # Tentativa 1: Modelo Legado (com a palavra "Unidade")
+                u_match_legacy = unit_pattern_legacy.match(line)
+                if u_match_legacy:
+                    current_unit = u_match_legacy.group(1).strip()
+                    raw_name = u_match_legacy.group(2).strip()
                     current_name = re.sub(r'\s+(Jurídico|Acordo|Cobrança)$', '', raw_name, flags=re.IGNORECASE).strip()
                     continue
 
-                # Faz o match da linha de cobrança
+                # Tentativa 2: Modelo Novo (Com ou sem Bloco)
+                # O "not re.match" garante que a gente não vai processar uma linha de dívida por engano aqui
+                if not re.match(r'^\d{2}/\d{2}', line):
+                    u_match_new = unit_pattern_new.match(line)
+                    if u_match_new:
+                        unidade = u_match_new.group(1).strip()
+
+                        # Blindagem: A unidade geralmente tem até uns 8 caracteres.
+                        # Isso evita capturar uma frase solta no PDF que não seja um morador.
+                        if len(unidade) <= 10:
+                            bloco = u_match_new.group(2)
+                            raw_name = u_match_new.group(3).strip()
+
+                            if bloco:
+                                current_unit = f"{bloco.strip()}-{unidade}"
+                            else:
+                                current_unit = unidade
+
+                            current_name = re.sub(r'\s+(Jurídico|Acordo|Cobrança)$', '', raw_name,
+                                                  flags=re.IGNORECASE).strip()
+                            continue
+
+                # ==========================================
+                # EXTRAÇÃO DA DÍVIDA
+                # ==========================================
                 match = pattern.match(line)
-                if match:
+                # Só anexa a dívida se tivermos conseguido ancorar uma unidade a ela
+                if match and current_unit:
                     charges.append(ChargeJSON(
-                        extractCondominium=current_condominium,  # <-- INJETADO NA SAÍDA
+                        extractCondominium=current_condominium,
                         unit=current_unit,
                         originalDraweeName=current_name,
                         dueDate=parse_br_date(match.group(1)),
@@ -797,6 +825,7 @@ async def extract_ucondo(file: UploadFile = File(...)):
     charges.extend(current_block_charges)
     return charges
 
+
 @app.post("/v1/extract/condomob", response_model=List[ChargeJSON])
 async def extract_condomob(file: UploadFile = File(...)):
     """ Extração Condomob (Resolução de Pagadores e Unidade via Totalizador Retroativo) """
@@ -811,55 +840,35 @@ async def extract_condomob(file: UploadFile = File(...)):
         if len(pdf.pages) > 0:
             first_page_text = pdf.pages[0].extract_text() or ""
 
-            # 1. Digital do Superlógica
             if "Valores atualizados até" in first_page_text and "Compet." in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Condomob, mas este arquivo pertence ao Superlógica."}
-                )
+                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
+                                                             "message": "Você selecionou Condomob, mas este arquivo pertence ao Superlógica."})
 
-            # 2. Digital do UCondo
             if "Relatório de Inadimplentes" in first_page_text and "Pendência" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Condomob, mas este arquivo pertence ao UCondo."}
-                )
+                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
+                                                             "message": "Você selecionou Condomob, mas este arquivo pertence ao UCondo."})
 
-            # 3. Digital do Condomínio21
             if "UNIDADES INADIMPLENTES" in first_page_text and "Data Base:" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Condomob, mas este arquivo pertence ao Condomínio21."}
-                )
+                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
+                                                             "message": "Você selecionou Condomob, mas este arquivo pertence ao Condomínio21."})
 
-            # 4. Validação Positiva (Opcional, mas muito recomendada)
-            # Se não tem a assinatura nativa do Condomob, rejeita também!
             if "Data de referência:" not in first_page_text and "Pagador:" not in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "O arquivo enviado não possui o formato esperado do Condomob."}
-                )
+                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
+                                                             "message": "O arquivo enviado não possui o formato esperado do Condomob."})
         # ==========================================
 
-    current_condominium = None # <-- Memória do Condomínio
+    current_condominium = None
     current_prop_name, current_prop_cpf = None, None
     current_inq_name, current_inq_cpf = None, None
     current_pagador = "proprietario"
 
-    # Acumula as cobranças de um bloco até encontrarmos a unidade dele
     current_block_data = []
 
-    # Regex para a linha da cobrança
     end_pattern = re.compile(
         r"(?:(\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+(\d+)|(\d{2}/\d{2}/\d{4})\s+(\d+)\s+(\d{2}/\d{4}))\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)$"
     )
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # Usamos enumerate para saber qual página estamos lendo (Página 0 = primeira página)
         for page_num, page in enumerate(pdf.pages):
             text = page.extract_text(layout=True)
             if not text: continue
@@ -867,33 +876,26 @@ async def extract_condomob(file: UploadFile = File(...)):
             lines = [re.sub(r'\s+', ' ', line.strip()) for line in text.split('\n') if line.strip()]
 
             # ==========================================
-            # CAPTURA DO CONDOMÍNIO (Primeira linha absoluta do PDF)
+            # CAPTURA DO CONDOMÍNIO
             # ==========================================
             if page_num == 0 and not current_condominium and len(lines) > 0:
                 raw_condo = lines[0].strip()
-
-                # Corta a string no momento em que encontrar "Inadimplência" ou "Data de"
-                # O [0] garante que vamos pegar apenas a parte ESQUERDA do corte (O nome limpo!)
                 clean_condo = re.split(r'(?i)(Inadimplência|Data de)', raw_condo)[0]
-
                 current_condominium = clean_condo.strip()
             # ==========================================
 
             for line in lines:
-                # Adicionamos a verificação para ignorar a linha caso seja o próprio nome do condomínio
-                if "Inadimplência" in line or "Data de" in line or line.startswith("Tipo") or line == current_condominium:
+                if "Inadimplência" in line or "Data de" in line or line.startswith(
+                        "Tipo") or line == current_condominium:
                     continue
 
                 # ==========================================
-                # CAPTURA DE PAGADORES (Preparado para Linhas Fundidas)
+                # CAPTURA DE PAGADORES
                 # ==========================================
-
-                # 1. Define quem é o pagador (Busca a palavra exata)
                 pag_match = re.search(r"Pagador:\s*([A-Za-z]+)", line, re.IGNORECASE)
                 if pag_match:
                     current_pagador = pag_match.group(1).strip().lower()
 
-                # 2. Captura o Proprietário (Para antes de invadir Pagador ou Inquilino)
                 prop_match = re.search(
                     r"Proprietário:\s+(.*?)(?:\s*\(([\d\.\-\/]+)\))?(?=\s*(?:Pagador|Inquilino|$))", line,
                     re.IGNORECASE)
@@ -901,7 +903,6 @@ async def extract_condomob(file: UploadFile = File(...)):
                     current_prop_name = prop_match.group(1).strip()
                     current_prop_cpf = prop_match.group(2).strip() if prop_match.group(2) else None
 
-                # 3. Captura o Inquilino (Para antes de invadir Pagador ou Proprietário)
                 inq_match = re.search(
                     r"Inquilino:\s+(.*?)(?:\s*\(([\d\.\-\/]+)\))?(?=\s*(?:Pagador|Proprietário|$))", line,
                     re.IGNORECASE)
@@ -909,25 +910,22 @@ async def extract_condomob(file: UploadFile = File(...)):
                     current_inq_name = inq_match.group(1).strip()
                     current_inq_cpf = inq_match.group(2).strip() if inq_match.group(2) else None
 
-                # Se encontrou qualquer um dos 3 na linha, pula para a próxima (pois não é linha financeira)
                 if pag_match or prop_match or inq_match:
                     continue
                 # ==========================================
 
                 # =========================================================
-                # O PULO DO GATO: CAPTURA DA UNIDADE NO TOTALIZADOR
+                # CAPTURA DA UNIDADE NO TOTALIZADOR
                 # =========================================================
                 tot_match = re.search(r"^([A-Za-z0-9-*]+)\s*:\s*\d+\s+cobrança", line, re.IGNORECASE)
                 if tot_match:
                     found_unit = tot_match.group(1).replace("*", "").strip()
-                    # Atualiza retroativamente todas as cobranças deste bloco e envia pro JSON
                     for data in current_block_data:
                         data["unit"] = found_unit
                         charges.append(ChargeJSON(**data))
-                    current_block_data = []  # Zera a memória para a próxima unidade
+                    current_block_data = []
                     continue
 
-                # Avalia e captura os valores financeiros
                 match = end_pattern.search(line)
                 if match:
                     prefix = line[:match.start()].strip()
@@ -945,7 +943,6 @@ async def extract_condomob(file: UploadFile = File(...)):
                     ref_month = match.group(1) or match.group(6)
                     due_date_str = match.group(2) or match.group(4)
 
-                    # Roteia a cobrança para o Inquilino ou Proprietário dependendo do status do bloco
                     if "inquilino" in current_pagador and current_inq_name:
                         drawee_name = current_inq_name
                         drawee_doc = current_inq_cpf
@@ -954,10 +951,12 @@ async def extract_condomob(file: UploadFile = File(...)):
                         drawee_doc = current_prop_cpf
 
                     current_block_data.append({
-                        "extractCondominium": current_condominium, # <-- INJETADO NA SAÍDA
-                        "unit": None,  # Será preenchido quando a linha 'tot_match' aparecer
+                        "extractCondominium": current_condominium,
+                        "unit": None,
                         "originalDraweeName": drawee_name,
-                        "originalDraweeDocument": drawee_doc,
+
+                        "originalDraweeDocument": format_document(drawee_doc),
+
                         "description": desc,
                         "documentNumber": doc_number,
                         "installment": installment,
@@ -971,9 +970,27 @@ async def extract_condomob(file: UploadFile = File(...)):
                         "totalAmount": parse_br_float(match.group(12))
                     })
 
-    # Rede de segurança: caso o PDF acabe abruptamente e o último totalizador não apareça
     if current_block_data:
         for data in current_block_data:
             charges.append(ChargeJSON(**data))
 
     return charges
+
+def format_document(doc_str: str) -> str | None:
+    """ Limpa a string e garante 11 dígitos para CPF ou 14 dígitos para CNPJ. """
+    if not doc_str:
+        return None
+
+    # Remove tudo que não for número
+    clean_doc = re.sub(r"\D", "", doc_str)
+
+    if not clean_doc:
+        return None
+
+    # Completa com zeros à esquerda dependendo do tamanho
+    if len(clean_doc) <= 11:
+        return clean_doc.zfill(11)  # CPF: Garante 11 dígitos
+    elif len(clean_doc) <= 14:
+        return clean_doc.zfill(14)  # CNPJ: Garante 14 dígitos
+
+    return clean_doc  # Retorna como está se for uma anomalia maior que 14
