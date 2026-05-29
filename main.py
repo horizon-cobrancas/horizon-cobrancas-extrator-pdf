@@ -87,46 +87,36 @@ async def extract_condominio21(file: UploadFile = File(...)):
     pdf_bytes = await file.read()
     charges = []
 
+    # ÚNICA abertura do PDF (otimização extrema de memória RAM e CPU)
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
         # ==========================================
-        # ABORDAGEM DEFENSIVA: Validação de Layout (Fail-Fast)
+        # ABORDAGEM DEFENSIVA: Validação Positiva (Whitelist / Fail-Fast)
         # ==========================================
-        if len(pdf.pages) > 0:
-            first_page_text = pdf.pages[0].extract_text() or ""
+        if len(pdf.pages) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "EMPTY_PDF", "message": "O PDF enviado está vazio ou corrompido."}
+            )
 
-            # 1. Digital do UCondo
-            if "Relatório de Inadimplentes" in first_page_text and "Pendência" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Condomínio21, mas este arquivo pertence ao UCondo."}
-                )
+        # Extrai o texto da primeira página preservando o layout
+        first_page_text = pdf.pages[0].extract_text(layout=True) or ""
 
-            # 2. Digital do Condomob
-            if "Data de referência:" in first_page_text and "Pagador:" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Condomínio21, mas este arquivo pertence ao Condomob."}
-                )
+        # A "Impressão Digital" exata do Group Software / Condominio21
+        is_condominio21 = (
+                "UNIDADES INADIMPLENTES" in first_page_text and
+                "Data Base:" in first_page_text and
+                "Unidade: todas" in first_page_text
+        )
 
-            # 3. Digital do Superlógica
-            if "Valores atualizados até" in first_page_text and "Compet." in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Condomínio21, mas este arquivo pertence ao Superlógica."}
-                )
-
-            # 4. Validação Positiva (Opcional, mas muito recomendada)
-            # Se não tem a assinatura nativa do Condomínio21, rejeita também!
-            if "UNIDADES INADIMPLENTES" not in first_page_text and "Data Base:" not in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "O arquivo enviado não possui o formato esperado do Condomínio21 / Group Software."}
-                )
+        if not is_condominio21:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "LAYOUT_MISMATCH",
+                    "message": "O arquivo enviado não possui a estrutura esperada do Condomínio21 / Group Software."
+                }
+            )
         # ==========================================
 
     # Memória global para lidar com quebras de página
@@ -248,283 +238,41 @@ async def extract_condominio21(file: UploadFile = File(...)):
 
     return charges
 
-@app.post("/v1/extract/plenna", response_model=List[ChargeJSON])
-async def extract_plenna(file: UploadFile = File(...)):
-    """ Extração padrão Condominio21 (Plenna) """
-    pdf_bytes = await file.read()
-    charges = []
-
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text(layout=True)
-            if not text: continue
-
-            lines = [re.sub(r'\s+', ' ', line.strip()) for line in text.split('\n') if line.strip()]
-            current_unit, current_name = None, None
-
-            # Padrão: [Descrição] [Mês] [Vencimento] [Valor] [Juros] [Multa] [Correção] [Total]
-            pattern = re.compile(
-                r"^(.*?)\s+(\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)$"
-            )
-
-            for line in lines:
-                if line.startswith("UNIDADES INADIMPLENTES") or line.startswith(
-                    "Total") or "Data Base" in line: continue
-
-                match = pattern.match(line)
-                if match:
-                    desc = match.group(1).strip()
-                    if desc.startswith("Total"): continue
-                    charges.append(ChargeJSON(
-                        unit=current_unit,
-                        originalDraweeName=current_name,
-                        description=desc,
-                        referenceMonth=match.group(2),
-                        dueDate=parse_br_date(match.group(3)),
-                        originalAmount=parse_br_float(match.group(4)),
-                        interestAmount=parse_br_float(match.group(5)),
-                        penaltyAmount=parse_br_float(match.group(6)),
-                        monetaryCorrection=parse_br_float(match.group(7)),
-                        totalAmount=parse_br_float(match.group(8))
-                    ))
-                else:
-                    if re.match(r"^[A-Za-z0-9-]{2,6}$", line) and " " not in line:
-                        current_unit, current_name = line, None
-                    elif current_unit and not current_name:
-                        current_name = line
-    return charges
-
-
-@app.post("/v1/extract/condominiojk", response_model=List[ChargeJSON])
-async def extract_condominiojk(file: UploadFile = File(...)):
-    """ Extração Condominio21 (Condominio JK) - Adaptado para Multi-Pagadores e Acordos sem Descrição """
-    pdf_bytes = await file.read()
-    charges = []
-
-    current_unit, current_name = None, None
-
-    blacklist = [
-        "UNIDADES INADIMPLENTES",
-        "Data Base",
-        "Condominio21",
-        "Group Software",
-        "CONDOMINIO DO EDIFICIO JK",
-        "Inadimplência",
-        "Mês: todos",
-        "Correção:",
-        "Juros:",
-        "Pág:",
-        "Mês Ref",
-        "Proj. Rec.",
-        "HONORÁRIOS DE COBRANÇAS"
-    ]
-
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text(layout=True)
-            if not text: continue
-
-            lines = [re.sub(r'\s+', ' ', line.strip()) for line in text.split('\n') if line.strip()]
-
-            # Adicionado o () dentro da busca dos valores numéricos para suportar negativos contábeis
-            pattern = re.compile(
-                r"^(.*?)\s+(\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)$"
-            )
-
-            for line in lines:
-                if any(garbage in line for garbage in blacklist):
-                    continue
-
-                if line.startswith("Total"):
-                    # O sistema imprime "Total 'NOME':" no fim do bloco.
-                    if "Total '" in line:
-                        current_name = None
-                    continue
-
-                match = pattern.match(line)
-
-                if match:
-                    desc = match.group(1).strip()
-
-                    # Se não houver descrição, é um bloco de Acordo/Renegociação
-                    if desc == "":
-                        desc = "Acordo / Diversos"
-
-                    if desc.startswith("Total"): continue
-
-                    charges.append(ChargeJSON(
-                        unit=current_unit,
-                        originalDraweeName=current_name,
-                        description=desc,
-                        referenceMonth=match.group(2),
-                        dueDate=parse_br_date(match.group(3)),
-                        originalAmount=parse_br_float(match.group(4)),
-                        interestAmount=parse_br_float(match.group(5)),
-                        penaltyAmount=parse_br_float(match.group(6)),
-                        monetaryCorrection=parse_br_float(match.group(7)),
-                        totalAmount=parse_br_float(match.group(8))
-                    ))
-                else:
-                    is_unit = False
-                    line_lower = line.lower()
-
-                    if line_lower.startswith("loja ") or line_lower.startswith("sala "):
-                        if re.match(r"^(loja|sala)\s+[a-z0-9-]+$", line_lower):
-                            is_unit = True
-                    elif re.match(r"^[A-Za-z0-9-]{2,8}$", line) and " " not in line:
-                        is_unit = True
-
-                    if is_unit:
-                        current_unit = line
-                        current_name = None
-
-                    elif current_unit:
-                        # Se não tinha nome, ou se a unidade está contida na linha atual (sub-pagador)
-                        if (not current_name) or (current_unit in line):
-                            clean_name = line
-
-                            if current_unit in clean_name:
-                                clean_name = clean_name.replace(current_unit, "")
-                            clean_name = re.sub(r'[-\s]+$', '', clean_name).strip()
-
-                            # Blindagem para evitar que datas órfãs ou lixo numérico virem nome de morador
-                            if len(clean_name) > 2 and not re.match(r'^[\d/.,\s-]+$', clean_name):
-                                current_name = clean_name
-
-    return charges
-
-@app.post("/v1/extract/condopalmas", response_model=List[ChargeJSON])
-async def extract_condopalmas(file: UploadFile = File(...)):
-    """ Extração Condominio21 (CondoPalmas) - Correção de página e limpeza de nomes """
-    pdf_bytes = await file.read()
-    charges = []
-
-    # FIX 1: Tiramos as variáveis de estado de dentro do loop de páginas.
-    # Agora elas sobrevivem à virada de página do PDF!
-    current_unit, current_name = None, None
-
-    with (pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf):
-        for page in pdf.pages:
-            text = page.extract_text(layout=True)
-            if not text: continue
-
-            lines = [re.sub(r'\s+', ' ', line.strip()) for line in text.split('\n') if line.strip()]
-
-            # Padrão para capturar as cobranças (Descrição, Mês, Vencimento, e os 5 valores)
-            pattern = re.compile(
-                r"^(.*?)\s+(\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)\s+([()\d.,]+)$"
-            )
-
-            blacklist = [
-                "UNIDADES INADIMPLENTES",
-                "Data Base",
-                "Condominio21",
-                "Group Software",
-                "Condo27 Administra",
-                "Residencial Luar do Cerrado",
-                "Inadimplência",
-                "Mês: todos",
-                "Correção:",
-                "Juros:",
-                "Pág:",
-                "Mês Ref Vencimento",
-                "Proj. Rec."
-            ]
-
-            for line in lines:
-                # 1. Ignora as linhas sujas usando a blacklist
-                if any(garbage in line for garbage in blacklist) or line.startswith("Total"):
-                    continue
-
-                match = pattern.match(line)
-
-                if match:
-                    desc = match.group(1).strip()
-                    if desc.startswith("Total") or desc == "": continue
-
-                    charges.append(ChargeJSON(
-                        unit=current_unit,
-                        originalDraweeName=current_name,
-                        description=desc,
-                        referenceMonth=match.group(2),
-                        dueDate=parse_br_date(match.group(3)),
-                        originalAmount=parse_br_float(match.group(4)),
-                        interestAmount=parse_br_float(match.group(5)),
-                        penaltyAmount=parse_br_float(match.group(6)),
-                        monetaryCorrection=parse_br_float(match.group(7)),
-                        totalAmount=parse_br_float(match.group(8))
-                    ))
-                else:
-                    # Verifica se a linha é apenas a Unidade (Ex: A-04, B-22)
-                    if re.match(r"^[A-Za-z0-9-]{2,8}$", line) and " " not in line:
-                        current_unit = line
-                        current_name = None  # Reseta o nome para o novo morador
-
-                    # Se já temos uma unidade guardada, mas não temos o nome, esta linha é o nome!
-                    elif current_unit and not current_name:
-                        clean_name = line
-
-                        # FIX 2: Sequência de limpeza do nome agressiva
-                        # 2.1 - Remove a unidade exata caso esteja no meio/fim da string
-                        if current_unit in clean_name:
-                            clean_name = clean_name.replace(current_unit, "")
-
-                        # 2.2 - Remove variações de blocos no final (Ex: " - B-004" quando a unidade é "B-04")
-                        clean_name = re.sub(r'[-\s]+[A-Za-z]-\d{2,4}$', '', clean_name)
-
-                        # 2.3 - Remove hifens e espaços solitários que sobraram no final (Ex: "João da Silva -")
-                        clean_name = re.sub(r'[-\s]+$', '', clean_name).strip()
-
-                        current_name = clean_name
-
-    return charges
-
-
 @app.post("/v1/extract/superlogica", response_model=List[ChargeJSON])
 async def extract_superlogica(file: UploadFile = File(...)):
     """ Extração padrão Superlogica """
     pdf_bytes = await file.read()
     charges = []
 
+    # ÚNICA abertura do PDF (otimização de memória RAM e CPU)
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
         # ==========================================
-        # ABORDAGEM DEFENSIVA: Validação de Layout (Fail-Fast)
+        # ABORDAGEM DEFENSIVA: Validação Positiva (Whitelist / Fail-Fast)
         # ==========================================
-        if len(pdf.pages) > 0:
-            first_page_text = pdf.pages[0].extract_text() or ""
+        if len(pdf.pages) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "EMPTY_PDF", "message": "O PDF enviado está vazio ou corrompido."}
+            )
 
-            # 1. Digital do UCondo
-            if "Relatório de Inadimplentes" in first_page_text and "Pendência" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Superlógica, mas este arquivo pertence ao UCondo."}
-                )
+        # Extrai o texto da primeira página preservando o layout
+        first_page_text = pdf.pages[0].extract_text(layout=True) or ""
 
-            # 2. Digital do Condomob
-            if "Data de referência:" in first_page_text and "Pagador:" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Superlógica, mas este arquivo pertence ao Condomob."}
-                )
+        # A "Impressão Digital" exata da Superlógica
+        is_superlogica = (
+                "Valores atualizados até" in first_page_text and
+                "Compet." in first_page_text
+        )
 
-            # 3. Digital do Condomínio21
-            if "UNIDADES INADIMPLENTES" in first_page_text and "Data Base:" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou Superlógica, mas este arquivo pertence ao Condomínio21."}
-                )
-
-            # 4. Validação Positiva
-            if "Valores atualizados até" not in first_page_text and "Compet." not in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "O arquivo enviado não possui o formato esperado do Superlógica."}
-                )
+        if not is_superlogica:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "LAYOUT_MISMATCH",
+                    "message": "O arquivo enviado não possui a estrutura esperada do Superlógica."
+                }
+            )
         # ==========================================
 
     current_unit, current_name = None, None
@@ -650,46 +398,35 @@ async def extract_ucondo(file: UploadFile = File(...)):
     pdf_bytes = await file.read()
     charges = []
 
+    # ÚNICA abertura do PDF (otimização de memória RAM e CPU)
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
         # ==========================================
-        # ABORDAGEM DEFENSIVA: Validação de Layout (Fail-Fast)
+        # ABORDAGEM DEFENSIVA: Validação Positiva (Whitelist / Fail-Fast)
         # ==========================================
-        if len(pdf.pages) > 0:
-            first_page_text = pdf.pages[0].extract_text() or ""
+        if len(pdf.pages) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "EMPTY_PDF", "message": "O PDF enviado está vazio ou corrompido."}
+            )
 
-            # 1. Digital do Superlógica
-            if "Valores atualizados até" in first_page_text and "Compet." in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou UCondo, mas este arquivo pertence ao Superlógica."}
-                )
+        # Extrai o texto da primeira página preservando o layout
+        first_page_text = pdf.pages[0].extract_text(layout=True) or ""
 
-            # 2. Digital do Condomob
-            if "Data de referência:" in first_page_text and "Pagador:" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou UCondo, mas este arquivo pertence ao Condomob."}
-                )
+        # A "Impressão Digital" exata do UCondo
+        is_ucondo = (
+                "Relatório de Inadimplentes" in first_page_text and
+                "Pendência" in first_page_text
+        )
 
-            # 3. Digital do Condomínio21
-            if "UNIDADES INADIMPLENTES" in first_page_text and "Data Base:" in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "Você selecionou UCondo, mas este arquivo pertence ao Condomínio21."}
-                )
-
-            # 4. Validação Positiva (Opcional, mas muito recomendada)
-            # Se não tem a assinatura nativa do UCondo, rejeita também!
-            if "Relatório de Inadimplentes" not in first_page_text and "Pendência" not in first_page_text:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"error": "LAYOUT_MISMATCH",
-                            "message": "O arquivo enviado não possui o formato esperado do UCondo."}
-                )
+        if not is_ucondo:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "LAYOUT_MISMATCH",
+                    "message": "O arquivo enviado não possui a estrutura esperada do UCondo."
+                }
+            )
         # ==========================================
 
     current_unit, current_name, current_cpf = None, None, None
@@ -832,29 +569,35 @@ async def extract_condomob(file: UploadFile = File(...)):
     pdf_bytes = await file.read()
     charges = []
 
+    # ÚNICA abertura do PDF (otimização de memória RAM e CPU)
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
         # ==========================================
-        # ABORDAGEM DEFENSIVA: Validação de Layout (Fail-Fast)
+        # ABORDAGEM DEFENSIVA: Validação Positiva (Whitelist / Fail-Fast)
         # ==========================================
-        if len(pdf.pages) > 0:
-            first_page_text = pdf.pages[0].extract_text() or ""
+        if len(pdf.pages) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "EMPTY_PDF", "message": "O PDF enviado está vazio ou corrompido."}
+            )
 
-            if "Valores atualizados até" in first_page_text and "Compet." in first_page_text:
-                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
-                                                             "message": "Você selecionou Condomob, mas este arquivo pertence ao Superlógica."})
+        # Extrai o texto da primeira página preservando o layout
+        first_page_text = pdf.pages[0].extract_text(layout=True) or ""
 
-            if "Relatório de Inadimplentes" in first_page_text and "Pendência" in first_page_text:
-                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
-                                                             "message": "Você selecionou Condomob, mas este arquivo pertence ao UCondo."})
+        # A "Impressão Digital" exata do Condomob
+        is_condomob = (
+                "Data de referência:" in first_page_text and
+                "Pagador:" in first_page_text
+        )
 
-            if "UNIDADES INADIMPLENTES" in first_page_text and "Data Base:" in first_page_text:
-                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
-                                                             "message": "Você selecionou Condomob, mas este arquivo pertence ao Condomínio21."})
-
-            if "Data de referência:" not in first_page_text and "Pagador:" not in first_page_text:
-                raise HTTPException(status_code=422, detail={"error": "LAYOUT_MISMATCH",
-                                                             "message": "O arquivo enviado não possui o formato esperado do Condomob."})
+        if not is_condomob:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "LAYOUT_MISMATCH",
+                    "message": "O arquivo enviado não possui a estrutura esperada do Condomob."
+                }
+            )
         # ==========================================
 
     current_condominium = None
