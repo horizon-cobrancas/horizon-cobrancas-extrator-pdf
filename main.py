@@ -74,6 +74,17 @@ def parse_br_date(val: str) -> Optional[str]:
     except:
         return v
 
+
+def clean_superlogica_name(raw_name: str) -> str:
+    name = re.sub(r"^[-–—]\s*", "", raw_name.strip())
+    return re.sub(
+        r"(?:\s*[-–—\uFFFD]\s*|\s+)(?:Jurídico|Acordo|Cobrança)$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
 @app.get("/")
 def read_root():
     return {"status": "alive"}
@@ -321,17 +332,22 @@ async def extract_superlogica(file: UploadFile = File(...)):
                 # IDENTIFICA TROCA DE UNIDADE/MORADOR
                 # ==========================================
 
+                # A linha do morador sempre vem imediatamente antes do cabeçalho da tabela.
+                # Isso impede que rodapés sejam interpretados como uma nova unidade.
+                next_line = lines[idx + 1] if idx + 1 < len(lines) else ""
+                is_unit_header = "Vencimento" in next_line and "Compet." in next_line
+
                 # Tentativa 1: Modelo Legado (com a palavra "Unidade")
-                u_match_legacy = unit_pattern_legacy.match(line)
+                u_match_legacy = unit_pattern_legacy.match(line) if is_unit_header else None
                 if u_match_legacy:
                     current_unit = u_match_legacy.group(1).strip()
                     raw_name = u_match_legacy.group(2).strip()
-                    current_name = re.sub(r'\s+(Jurídico|Acordo|Cobrança)$', '', raw_name, flags=re.IGNORECASE).strip()
+                    current_name = clean_superlogica_name(raw_name)
                     continue
 
                 # Tentativa 2: Modelo Novo (Com ou sem Bloco)
                 # O "not re.match" garante que a gente não vai processar uma linha de dívida por engano aqui
-                if not re.match(r'^\d{2}/\d{2}', line):
+                if is_unit_header and not re.match(r'^\d{2}/\d{2}', line):
                     u_match_new = unit_pattern_new.match(line)
                     if u_match_new:
                         unidade = u_match_new.group(1).strip()
@@ -347,8 +363,7 @@ async def extract_superlogica(file: UploadFile = File(...)):
                             else:
                                 current_unit = unidade
 
-                            current_name = re.sub(r'\s+(Jurídico|Acordo|Cobrança)$', '', raw_name,
-                                                  flags=re.IGNORECASE).strip()
+                            current_name = clean_superlogica_name(raw_name)
                             continue
 
                 # ==========================================
