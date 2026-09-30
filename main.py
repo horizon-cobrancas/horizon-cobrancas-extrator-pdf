@@ -1292,6 +1292,12 @@ async def extract_condomob(file: UploadFile = File(...)):
         re.IGNORECASE,
     )
     page_header_pattern = re.compile(r"^inadimplencia pag\. (\d+) de\s*(\d+)$")
+    reference_parameters_pattern = re.compile(
+        r"^data de referencia: (\d{2}/\d{2}/\d{4}); "
+        r"(?:vencimento: sempre a (\d{2}/\d{2}/\d{4}); )?"
+        r"unidades com/sem processo judicial; "
+        r"valor atualizado \(multa \+ juros \+ atualizacao \+ honorarios\)$"
+    )
     final_summary_pattern = re.compile(
         rf"^(\d+)\s+unidade\(s\)\s+\(([\d.,]+)%\s+de\s+(\d+)\)"
         rf"\s+(\d+)\s+cobranca\(s\)\s+({money})\s+({money})\s+({money})"
@@ -1374,10 +1380,8 @@ async def extract_condomob(file: UploadFile = File(...)):
                 if normalize_layout_text(lines[1]) != "palmas - to":
                     raise_condomob_layout_error("localidade do relatório alterada", page_number, 2)
                 page_header_index = 2
-                content_start = 5
             else:
                 page_header_index = 0
-                content_start = 3
 
             page_header_match = page_header_pattern.match(
                 normalize_layout_text(lines[page_header_index])
@@ -1389,17 +1393,33 @@ async def extract_condomob(file: UploadFile = File(...)):
                 or int(page_header_match.group(2)) != page_count
             ):
                 raise_condomob_layout_error("paginação inconsistente", page_number)
-            if len(lines) < content_start:
+            if len(lines) <= page_header_index + 2:
                 raise_condomob_layout_error("cabeçalho incompleto", page_number)
 
-            reference_line = normalize_layout_text(lines[page_header_index + 1])
-            rates_line = normalize_layout_text(lines[page_header_index + 2])
-            if not (
-                re.match(r"^data de referencia: \d{2}/\d{2}/\d{4};", reference_line)
-                and "unidades com/sem processo judicial" in reference_line
-                and "valor atualizado" in reference_line
-            ):
+            rates_candidates = [
+                index
+                for index in range(page_header_index + 2, min(page_header_index + 4, len(lines)))
+                if normalize_layout_text(lines[index]).startswith("multa:")
+            ]
+            if len(rates_candidates) != 1:
+                raise_condomob_layout_error("parâmetros financeiros alterados", page_number)
+            rates_index = rates_candidates[0]
+            reference_parts = lines[page_header_index + 1:rates_index]
+            if not 1 <= len(reference_parts) <= 2:
                 raise_condomob_layout_error("parâmetros de referência alterados", page_number)
+
+            reference_line = normalize_layout_text(" ".join(reference_parts))
+            rates_line = normalize_layout_text(lines[rates_index])
+            content_start = rates_index + 1
+            reference_match = reference_parameters_pattern.fullmatch(reference_line)
+            if not reference_match:
+                raise_condomob_layout_error("parâmetros de referência alterados", page_number)
+            try:
+                datetime.strptime(reference_match.group(1), "%d/%m/%Y")
+                if reference_match.group(2):
+                    datetime.strptime(reference_match.group(2), "%d/%m/%Y")
+            except ValueError:
+                raise_condomob_layout_error("data dos parâmetros de referência inválida", page_number)
             if not (
                 rates_line.startswith("multa:")
                 and "; juros:" in rates_line
