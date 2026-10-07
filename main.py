@@ -367,6 +367,10 @@ async def extract_condominio21(file: UploadFile = File(...)):
             )
             if has_table_header:
                 header_end = common_header_end + 1
+            elif grand_total_seen and class_summary_started and not class_summary_finished:
+                # O resumo por classe pode continuar na página seguinte sem repetir
+                # o cabeçalho da tabela principal nem o cabeçalho das classes.
+                header_end = common_header_end
             elif (
                 page_number == page_count
                 and len(lines) > common_header_end
@@ -1294,7 +1298,8 @@ async def extract_condomob(file: UploadFile = File(...)):
     page_header_pattern = re.compile(r"^inadimplencia pag\. (\d+) de\s*(\d+)$")
     reference_parameters_pattern = re.compile(
         r"^data de referencia: (\d{2}/\d{2}/\d{4}); "
-        r"(?:vencimento: sempre a (\d{2}/\d{2}/\d{4}); )?"
+        r"(?:vencimento: (?:sempre a (\d{2}/\d{2}/\d{4})|"
+        r"(\d{2}/\d{2}/\d{4}) a sempre); )?"
         r"unidades com/sem processo judicial; "
         r"valor atualizado \(multa \+ juros \+ atualizacao \+ honorarios\)$"
     )
@@ -1415,9 +1420,9 @@ async def extract_condomob(file: UploadFile = File(...)):
             if not reference_match:
                 raise_condomob_layout_error("parâmetros de referência alterados", page_number)
             try:
-                datetime.strptime(reference_match.group(1), "%d/%m/%Y")
-                if reference_match.group(2):
-                    datetime.strptime(reference_match.group(2), "%d/%m/%Y")
+                for parameter_date in reference_match.groups():
+                    if parameter_date:
+                        datetime.strptime(parameter_date, "%d/%m/%Y")
             except ValueError:
                 raise_condomob_layout_error("data dos parâmetros de referência inválida", page_number)
             if not (
