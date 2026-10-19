@@ -1365,7 +1365,8 @@ async def extract_condomob(file: UploadFile = File(...)):
 
             normalized_footer = normalize_layout_text(lines[-1])
             if not re.match(
-                r"^torre assessoria condominial \d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$",
+                r"^(?:torre assessoria condominial|unika condominios ltda) "
+                r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$",
                 normalized_footer,
             ):
                 raise_condomob_layout_error("rodapé ausente ou inválido", page_number)
