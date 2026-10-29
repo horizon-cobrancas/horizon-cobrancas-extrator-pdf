@@ -246,7 +246,7 @@ async def extract_condominio21(file: UploadFile = File(...)):
         r"^unidades inadimplentes (\d{2}/\d{2}/\d{4}) pag: (\d+)/(\d+)$"
     )
     unit_pattern = re.compile(
-        r"^(?:\d{2,8}|[A-Za-z]{1,10}-\d{1,8}|[A-Za-z]{1,10}\d{1,8}|(?:Loja|Sala)\s+[A-Za-z0-9-]+)$",
+        r"^(?:\d{2,8}|[A-Za-z]{1,10}(?:[-\s]?\d{1,8})|(?:Loja|Sala)\s+[A-Za-z0-9-]+)$",
         re.IGNORECASE,
     )
     expected_table_header = (
